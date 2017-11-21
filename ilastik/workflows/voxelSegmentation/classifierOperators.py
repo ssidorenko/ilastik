@@ -1,7 +1,5 @@
 from __future__ import absolute_import
-from builtins import zip
 from builtins import map
-from builtins import range
 ###############################################################################
 #   lazyflow: data flow based lazy parallel computation framework
 #
@@ -24,27 +22,22 @@ from builtins import range
 #          http://ilastik.org/license/
 ###############################################################################
 # Python
-import copy
 import logging
-traceLogger = logging.getLogger("TRACE." + __name__)
+
 
 # SciPy
 import numpy
 
 # lazyflow
 from lazyflow.graph import Operator, InputSlot, OutputSlot, OrderedSignal, OperatorWrapper
-from lazyflow.roi import sliceToRoi, roiToSlice, getIntersection, roiFromShape, nonzero_bounding_box, enlargeRoiForHalo
 from lazyflow.utility import Timer
-from lazyflow.classifiers import LazyflowVectorwiseClassifierABC, LazyflowVectorwiseClassifierFactoryABC, \
-    LazyflowPixelwiseClassifierABC, LazyflowPixelwiseClassifierFactoryABC
-
-from lazyflow.operators.opConcatenateFeatureMatrices import OpConcatenateFeatureMatrices
+from lazyflow.classifiers import LazyflowVectorwiseClassifierABC, LazyflowVectorwiseClassifierFactoryABC
 
 from .opFeatureMatrixCache import OpFeatureMatrixCache
 from .utils import get_supervoxel_features, get_supervoxel_labels, slic_to_mask
 
 
-
+traceLogger = logging.getLogger("TRACE." + __name__)
 logger = logging.getLogger(__name__)
 
 
@@ -53,12 +46,15 @@ class OpTrainSuperVoxelClassifierBlocked(Operator):
     Owns two child training operators, for 'vectorwise' and 'pixelwise' classifier types.
     Chooses which one to use based on the type of ClassifierFactory provided as input.
     """
-    Images = InputSlot(level=1)
-    SupervoxelValues = InputSlot(level=1)
-    Labels = InputSlot(level=1)
+    SupervoxelFeatures = InputSlot(level=1)
+    SupervoxelSegmentation = InputSlot(level=1)
+    SupervoxelLabels = InputSlot(level=1)
     ClassifierFactory = InputSlot()
     nonzeroLabelBlocks = InputSlot(level=1)  # Used only in the pixelwise case.
     MaxLabel = InputSlot()
+
+    Images = InputSlot(level=1)
+    Labels = InputSlot(level=1)
 
     Classifier = OutputSlot()
 
@@ -71,12 +67,13 @@ class OpTrainSuperVoxelClassifierBlocked(Operator):
         # Fully connect the vectorwise training operator
         self._opVectorwiseTrain = OpTrainSupervoxelwiseClassifierBlocked(parent=self)
         self._opVectorwiseTrain.Images.connect(self.Images)
-        self._opVectorwiseTrain.SupervoxelValues.connect(self.SupervoxelValues)
+        self._opVectorwiseTrain.SupervoxelSegmentation.connect(self.SupervoxelSegmentation)
         self._opVectorwiseTrain.Labels.connect(self.Labels)
         self._opVectorwiseTrain.ClassifierFactory.connect(self.ClassifierFactory)
+        self._opVectorwiseTrain.SupervoxelFeatures.connect(self.SupervoxelFeatures)
+        self._opVectorwiseTrain.SupervoxelLabels.connect(self.SupervoxelLabels)
         self._opVectorwiseTrain.MaxLabel.connect(self.MaxLabel)
         self._opVectorwiseTrain.progressSignal.subscribe(self.progressSignal)
-
         # # Fully connect the pixelwise training operator
         # self._opPixelwiseTrain = OpTrainPixelwiseClassifierBlocked(parent=self)
         # self._opPixelwiseTrain.Images.connect(self.Images)
@@ -115,16 +112,14 @@ class OpTrainSuperVoxelClassifierBlocked(Operator):
 
 class OpTrainSupervoxelwiseClassifierBlocked(Operator):
     Images = InputSlot(level=1)
-    SupervoxelValues = InputSlot(level=1)
     Labels = InputSlot(level=1)
+    SupervoxelSegmentation = InputSlot(level=1)
+    SupervoxelFeatures = InputSlot(level=1)
+    SupervoxelLabels = InputSlot(level=1)
     ClassifierFactory = InputSlot()
     MaxLabel = InputSlot()
 
     Classifier = OutputSlot()
-
-    # Images[N] ---                                                                                         MaxLabel ------
-    #              \                                                                                                       \
-    # Labels[N] --> opFeatureMatrixCaches ---(FeatureImage[N])---> opConcatenateFeatureImages ---(label+feature matrix)---> OpTrainFromFeatures ---(Classifier)--->
 
     def __init__(self, *args, **kwargs):
         print("init {}".format(self.__class__))
@@ -135,6 +130,10 @@ class OpTrainSupervoxelwiseClassifierBlocked(Operator):
         self._opFeatureMatrixCaches.LabelImage.connect(self.Labels)
         self._opFeatureMatrixCaches.FeatureImage.connect(self.Images)
 
+        # self._opSupervoxelFeaturesCaches = OperatorWrapper(OpSupervoxelFeaturesCaches, parent=self)
+        # self._opFeatureMatrixCaches.LabelImage.connect(self.Labels)
+        # self._opFeatureMatrixCaches.FeatureImage.connect(self.Images)
+
         # self._opConcatenateFeatureMatrices = OpConcatenateFeatureMatrices(parent=self)
         # self._opConcatenateFeatureMatrices.FeatureMatrices.connect(self._opFeatureMatrixCaches.LabelAndFeatureMatrix)
         # self._opConcatenateFeatureMatrices.ProgressSignals.connect(self._opFeatureMatrixCaches.ProgressSignal)
@@ -142,10 +141,13 @@ class OpTrainSupervoxelwiseClassifierBlocked(Operator):
         self._opTrainFromFeatures = OpTrainClassifierFromFeatureVectorsAndSupervoxelMask(parent=self)
         self._opTrainFromFeatures.ClassifierFactory.connect(self.ClassifierFactory)
         self._opTrainFromFeatures.LabelAndFeatureMatrix.connect(self._opFeatureMatrixCaches.LabelAndFeatureMatrix)
-        self._opTrainFromFeatures.SupervoxelValues.connect(self.SupervoxelValues)
+        # self._opTrainFromFeatures.SupervoxelSegmentation.connect(self.SupervoxelSegmentation)
         self._opTrainFromFeatures.Labels.connect(self.Labels)
         self._opTrainFromFeatures.MaxLabel.connect(self.MaxLabel)
         self._opTrainFromFeatures.Images.connect(self.Images)
+        # self._opTrainFromFeatures.SupervoxelFeatures.connect(self.SupervoxelFeatures)
+        # self._opTrainFromFeatures.SupervoxelLabels.connect(self.SupervoxelLabels)
+
 
         self.Classifier.connect(self._opTrainFromFeatures.Classifier)
 
@@ -175,14 +177,21 @@ class OpTrainSupervoxelwiseClassifierBlocked(Operator):
 
     def propagateDirty(self, slot, subindex, roi):
         pass
+        # print(
+        #     "propagate dirty OpTrainSupervoxelwiseClassifierBlocked slot:{} subindex:{} roi:{}".format(
+        #         slot, subindex, roi.pprint()
+        # ))
 
 
 class OpTrainClassifierFromFeatureVectorsAndSupervoxelMask(Operator):
     ClassifierFactory = InputSlot()
     LabelAndFeatureMatrix = InputSlot(level=1)
-    SupervoxelValues = InputSlot(level=1)
+    SupervoxelFeatures = InputSlot(level=1)
+    SupervoxelLabels = InputSlot(level=1)
+    SupervoxelSegmentation = InputSlot(level=1)
     Labels = InputSlot(level=1)
     Images = InputSlot(level=1)
+
 
     MaxLabel = InputSlot()
     Classifier = OutputSlot()
@@ -192,31 +201,19 @@ class OpTrainClassifierFromFeatureVectorsAndSupervoxelMask(Operator):
         super(OpTrainClassifierFromFeatureVectorsAndSupervoxelMask, self).__init__(*args, **kwargs)
         self.trainingCompleteSignal = OrderedSignal()
 
-        # TODO: Progress...
-        #self.progressSignal = OrderedSignal()
-
     def setupOutputs(self):
         self.Classifier.meta.dtype = object
         self.Classifier.meta.shape = (1,)
 
         # Special metadata for downstream operators using the classifier
         self.Classifier.meta.classifier_factory = self.ClassifierFactory.value
+        # self.Images[0].setDirty()
 
     def execute(self, slot, subindex, roi, result):
-        channel_names = self.LabelAndFeatureMatrix.meta.channel_names
-        labels_and_features = self.LabelAndFeatureMatrix[0].value
-        featMatrix = labels_and_features[:, 1:]
-        labelsMatrix = labels_and_features[:, 0:1].astype(numpy.uint32)
-        superVoxelValuesMatrix = self.SupervoxelValues[0].value
-
-        maxLabel = self.MaxLabel.value
-        print("SV NLABELS {}".format(maxLabel))
-        if featMatrix.shape[0] < maxLabel:
-            # If there isn't enough data for the random forest to train with, return None
-            result[:] = None
-            self.trainingCompleteSignal()
-            return
-
+        # TODO: when converting to multilane operator, iterate over stacks but concatenates supervoxels feature matrices
+        # import IPython; IPython.embed()
+        channel_names = self.Images[0].meta.channel_names
+        print("train")
         classifier_factory = self.ClassifierFactory.value
         assert issubclass(type(classifier_factory), LazyflowVectorwiseClassifierFactoryABC), \
             "Factory is of type {}, which does not satisfy the LazyflowVectorwiseClassifierFactoryABC interface."\
@@ -226,16 +223,16 @@ class OpTrainClassifierFromFeatureVectorsAndSupervoxelMask(Operator):
         print("labels shape {}".format(self.Labels[0].value.shape))
         print("Image shape {}".format(self.Images[0].value.shape))
         print("ROI {}".format(roi.pprint()))
-        # featMatrix = featMatrix.reshape(list(self.Images[0].value.shape[:3])+[featMatrix.shape[1]])
-        supervoxelFeatures = get_supervoxel_features(featMatrix, self.Images[0].value[:,:,:,0], superVoxelValuesMatrix)
-        supervoxelLabels = get_supervoxel_labels(self.Labels[0].value, superVoxelValuesMatrix)
-        # indices = numpy.arange(supervoxelFeatures.shape[0])
+
+        # supervoxelFeatures = get_supervoxel_features(self.Images[0].value, supervoxelSegmentationMatrix)
+        # supervoxelLabels = get_supervoxel_labels(self.Labels[0].value, supervoxelSegmentationMatrix)
+        supervoxelFeatures = self.SupervoxelFeatures[0].value
+        supervoxelLabels = self.SupervoxelLabels[0].value
 
         mask = numpy.where(supervoxelLabels != 0)
         supervoxelFeatures = supervoxelFeatures[mask]
         supervoxelLabels = supervoxelLabels[mask]
 
-        # import ipdb; ipdb.set_trace()
         print("pixel labels {}".format(numpy.unique(self.Labels[0].value)))
         print("Training new classifier: {}".format(classifier_factory.description))
         print("features before training {}".format(supervoxelFeatures))
@@ -254,10 +251,11 @@ class OpTrainClassifierFromFeatureVectorsAndSupervoxelMask(Operator):
 
 
 class OpSupervoxelClassifierPredict(Operator):
-    Image = InputSlot()
+    Image = InputSlot()  # We still use the feature images slot, because we need to know which shape the predictions have when biuldign them from the supervoxel predictions
+    SupervoxelFeatures = InputSlot()
     LabelsCount = InputSlot()
     Classifier = InputSlot()
-    SupervoxelValues = InputSlot()
+    SupervoxelSegmentation = InputSlot()
 
     # An entire prediction request is skipped if the mask is all zeros for the requested roi.
     # Otherwise, the request is serviced as usual and the mask is ignored.
@@ -304,7 +302,8 @@ class OpSupervoxelClassifierPredict(Operator):
         self._prediction_op.Image.connect(self.Image)
         self._prediction_op.LabelsCount.connect(self.LabelsCount)
         self._prediction_op.Classifier.connect(self.Classifier)
-        self._prediction_op.SupervoxelValues.connect(self.SupervoxelValues)
+        self._prediction_op.SupervoxelSegmentation.connect(self.SupervoxelSegmentation)
+        self._prediction_op.SupervoxelFeatures.connect(self.SupervoxelFeatures)
         self.PMaps.connect(self._prediction_op.PMaps)
 
     def execute(self, slot, subindex, roi, result):
@@ -319,8 +318,8 @@ class OpSupervoxelwiseClassifierPredict(Operator):
     Image = InputSlot()
     LabelsCount = InputSlot()
     Classifier = InputSlot()
-    SupervoxelValues = InputSlot()
-
+    SupervoxelSegmentation = InputSlot()
+    SupervoxelFeatures = InputSlot()
 
     # An entire prediction request is skipped if the mask is all zeros for the requested roi.
     # Otherwise, the request is serviced as usual and the mask is ignored.
@@ -402,11 +401,12 @@ class OpSupervoxelwiseClassifierPredict(Operator):
         input_data = numpy.asarray(input_data, numpy.float32)
 
         shape = input_data.shape
-        prod = numpy.prod(shape[:-1])
-        features = input_data.reshape((prod, shape[-1]))
-        features = get_supervoxel_features(features, self.Image.value[:,:,:,0], self.SupervoxelValues.value)
+        # prod = numpy.prod(shape[:-1])
+        # features = input_data.reshape((prod, shape[-1]))
+        features = self.SupervoxelFeatures.value
+
         print("features before prediction {}".format(features))
-        # features = get_supervoxel_features(features, self.SupervoxelValues.value)
+        # features = get_supervoxel_features(features, self.SupervoxelSegmentation.value)
 
         with Timer() as prediction_timer:
             probabilities = classifier.predict_probabilities(features)
@@ -415,7 +415,7 @@ class OpSupervoxelwiseClassifierPredict(Operator):
         print(classifier.known_classes)
         print("probs shape: {}".format(probabilities.shape))
         # import ipdb; ipdb.set_trace()
-        probabilities = slic_to_mask(self.SupervoxelValues.value, probabilities).reshape(-1, probabilities.shape[-1])
+        probabilities = slic_to_mask(self.SupervoxelSegmentation.value, probabilities).reshape(-1, probabilities.shape[-1])
         print("probs shape unslicd: {}".format(probabilities.shape))
 
         logger.debug("Features took {} seconds, Prediction took {} seconds for roi: {} : {}"
